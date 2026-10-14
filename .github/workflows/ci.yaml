@@ -1,0 +1,165 @@
+name: CI
+
+# CI for the private invadelol/app, on this public repo's free runners: type-checks and builds the
+# frontend, checks the translations, versions and bundled data, and runs the Rust tests and clippy
+# on macOS and Windows.
+#
+# This repo is public, and so are its workflow logs, annotations, artifacts and caches. The app's
+# code must never reach them, so:
+#   - it only runs when started by hand (workflow_dispatch), never on push, pull requests or a schedule;
+#   - every command that touches the app runs through .github/scripts/q.sh. Its output goes to
+#     $RUNNER_TEMP/ci.log, and the public log gets "ok", or the `test result:` lines and the exit code;
+#   - at the end of each job, .github/scripts/seal.sh encrypts that log (and any saved fuzz cases)
+#     for .github/ci-logs.pub.pem, whose private key never leaves the maintainer's Mac. Only the
+#     encrypted file is uploaded, as an artifact kept 14 days;
+#   - no caches of any kind.
+# The app is checked out with the read-only deploy key in the APP_DEPLOY_KEY secret.
+#
+# Run it:
+#   gh workflow run ci.yaml -R invadelol/releases -f ref=<branch>
+#   (ref: branch, tag or commit of invadelol/app; add -f deep=true for 50x more fuzz and property cases)
+# Read the sealed logs on the Mac (run id from `gh run list -R invadelol/releases`):
+#   node ~/.invade-ci/open-logs.mjs <run-id>
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of invadelol/app
+        type: string
+        required: true
+        default: main
+      deep:
+        description: Run the fuzz and property tests 50 times longer
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  NO_COLOR: 1
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: invadelol/app
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          persist-credentials: false
+          path: app
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm install --frozen-lockfile
+      # vue-tsc, then the production build.
+      - name: Build
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm build
+      # Images come from invade.lol's proxy only: no Riot CDN host in src/, the CSP or the bundle.
+      - name: Check CDN hosts
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm check-cdn
+      # Fails on placeholder mistakes in a translation; untranslated keys are only listed.
+      - name: Check translations
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm i18n
+      # The updater compares versions: they must agree everywhere.
+      - name: Check versions
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" node scripts/check-version.mjs
+      # Data pipeline: statistics unit tests, then the quality gates on the bundled data/.
+      - name: Data pipeline tests
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" node --test scripts/test/*.test.mjs
+      - name: Check data
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" node scripts/check-data.mjs
+      - name: Seal the log
+        if: always()
+        env:
+          NAME: frontend
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/seal.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-frontend
+          path: ${{ runner.temp }}/sealed-frontend.enc
+          if-no-files-found: ignore
+          retention-days: 14
+
+  rust:
+    name: Rust (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ inputs.deep && 180 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            seal: rust-macos
+          - name: Windows
+            os: windows-latest
+            seal: rust-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: invadelol/app
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          persist-credentials: false
+          path: app
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Unit tests and the deep suite (src/suite: fuzzing, property, security and per-OS tests).
+      # The `#[ignore]` ones need a running League client or screen access. A failing fuzz case is
+      # saved in src-tauri/target/invade-fuzz, which goes into the sealed log.
+      - name: Tests
+        working-directory: app/src-tauri
+        env:
+          INVADE_FUZZ_SCALE: ${{ inputs.deep && '50' || '1' }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" cargo test --lib --locked
+      # Crash patterns the suite found are lint errors (Cargo.toml `[lints.clippy]`).
+      - name: Clippy
+        working-directory: app/src-tauri
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" cargo clippy --lib --tests --locked -- -D warnings
+      # The script reads src-tauri/target/debug/deps relative to the working directory, so it runs
+      # from the app's root.
+      - name: Diagnose Windows imports
+        if: failure() && runner.os == 'Windows'
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" python scripts/check-windows-imports.py
+      - name: Seal the log
+        if: always()
+        env:
+          NAME: ${{ matrix.seal }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/seal.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-${{ matrix.seal }}
+          path: ${{ runner.temp }}/sealed-${{ matrix.seal }}.enc
+          if-no-files-found: ignore
+          retention-days: 14

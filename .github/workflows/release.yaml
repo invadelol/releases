@@ -1,0 +1,205 @@
+name: Release
+
+# Builds a tag of the private invadelol/app: the Windows installer (NSIS) and the macOS disk images
+# (Apple Silicon + Intel). Signs the update packages and attaches everything to a release of this
+# repo, plus the `latest.json` feed the app updates from
+# (invadelol/releases/releases/latest/download/latest.json).
+#
+# This repo is public, and so are its workflow logs; the app's code is not. As in ci.yaml, every
+# command that touches the app's code runs through .github/scripts/q.sh, and its output is sealed
+# for the maintainer's key at the end of each job (open it with
+# `node ~/.invade-ci/open-logs.mjs <run-id>`). The frontend is built quietly before tauri-action,
+# which is told to skip beforeBuildCommand. Its Rust build allows all warnings, so it prints no
+# warning code frames.
+#
+# Release steps:
+#   1. In invadelol/app, bump the version in package.json, src-tauri/tauri.conf.json,
+#      src-tauri/Cargo.toml and src-tauri/Cargo.lock together (`node scripts/check-version.mjs`).
+#   2. Run ci.yaml on that commit; it must pass. Its clippy step (-D warnings) also keeps build.rs
+#      free of warnings; the macOS builds below cross-compile, so RUSTFLAGS does not reach build.rs.
+#   3. Tag the commit (e.g. v0.3.1) and push the tag to invadelol/app.
+#   4. gh workflow run release.yaml -R invadelol/releases -f tag=v0.3.1
+#      The build jobs fill a draft release with the installers and the signed update packages.
+#      Then the publish job assembles latest.json and publishes the release as the latest one,
+#      and installed copies update from it.
+#
+# Secrets of this repo (Settings → Secrets and variables → Actions):
+#   APP_DEPLOY_KEY
+#     Read-only deploy key of invadelol/app, to check out the app.
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD (may be empty)
+#     Sign the update packages; the matching public key is in tauri.conf.json. Not set yet: add
+#     both before the first release.
+# The release is created in this repo, so the built-in token (contents: write) is enough.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of invadelol/app to release, like v0.3.1
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  NO_COLOR: 1
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-latest
+            args: --bundles nsis
+            rust-targets: ''
+            seal: release-windows-x64
+          - name: macOS (Apple Silicon)
+            os: macos-latest
+            args: --target aarch64-apple-darwin --bundles app,dmg
+            rust-targets: aarch64-apple-darwin
+            seal: release-macos-arm64
+          - name: macOS (Intel)
+            os: macos-latest
+            args: --target x86_64-apple-darwin --bundles app,dmg
+            rust-targets: x86_64-apple-darwin
+            seal: release-macos-x64
+    steps:
+      - name: Tag is a release version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'The tag must look like v1.2.3.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: invadelol/app
+          ref: refs/tags/${{ inputs.tag }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          persist-credentials: false
+          path: app
+      - name: Tag matches the app version
+        working-directory: app
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" node scripts/check-version.mjs "$TAG"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - name: Install
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm install --frozen-lockfile
+      # vue-tsc, then the production build into dist/, which tauri-action bundles as it is.
+      - name: Build the frontend
+        working-directory: app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" pnpm build
+      - name: Test before packaging
+        working-directory: app/src-tauri
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" cargo test --lib --locked
+      # Merged into tauri.conf.json by `tauri build --config`: the frontend is already built, so
+      # tauri-action must not run beforeBuildCommand (`pnpm build`) again in the public log.
+      - name: Skip the frontend build in tauri-action
+        run: echo '{"build":{"beforeBuildCommand":""}}' > "$RUNNER_TEMP/tauri-prebuilt.json"
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # This build's output is public: allow all warnings, so none prints a code frame. The app
+          # has no .cargo/config.toml, so there are no `build.rustflags` this would override.
+          RUSTFLAGS: -Awarnings
+          # Ad-hoc signature so macOS reports "unidentified developer" instead of "damaged".
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          # Signs the update packages (.app.tar.gz / NSIS zip); the app refuses unsigned updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          owner: invadelol
+          repo: releases
+          # The tag is created in this repo, on its default branch (the app's commit does not
+          # exist here).
+          releaseCommitish: main
+          tagName: ${{ inputs.tag }}
+          releaseName: Invade ${{ inputs.tag }}
+          releaseBody: |
+            Builds are not code-signed. Installed copies update themselves: Invade checks for new versions in the background and installs when you click **Update** (Settings → Updates).
+
+            - **Windows**: `Invade_*_x64-setup.exe`. SmartScreen may warn: click **More info → Run anyway**.
+            - **macOS Apple Silicon (M1 and later)**: `Invade_*_aarch64.dmg`
+            - **macOS Intel**: `Invade_*_x64.dmg`
+
+            On macOS, drag Invade to Applications, then right-click it → **Open** the first time.
+            If macOS says the app is damaged, run `xattr -cr /Applications/Invade.app` once.
+          releaseDraft: true
+          # The updater reads `invadelol/releases/releases/latest/download/latest.json`, which GitHub only serves
+          # from a full (non-prerelease) release.
+          prerelease: false
+          # One publisher assembles latest.json after every platform is ready.
+          includeUpdaterJson: false
+          args: ${{ matrix.args }} --config ${{ runner.temp }}/tauri-prebuilt.json
+      - name: Seal the log
+        if: always()
+        env:
+          NAME: ${{ matrix.seal }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/seal.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-${{ matrix.seal }}
+          path: ${{ runner.temp }}/sealed-${{ matrix.seal }}.enc
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish complete release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: invadelol/app
+          ref: refs/tags/${{ inputs.tag }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          persist-credentials: false
+          path: app
+      - name: Assemble signed updater feed and publish
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo invadelol/releases --json assets,body > release.json
+          gh release download "$RELEASE_TAG" --repo invadelol/releases --pattern '*.sig'
+          bash "$GITHUB_WORKSPACE/.github/scripts/q.sh" node scripts/build-updater-feed.mjs "${RELEASE_TAG#v}" release.json . latest.json
+          gh release upload "$RELEASE_TAG" --repo invadelol/releases latest.json --clobber
+          gh release edit "$RELEASE_TAG" --repo invadelol/releases --draft=false --latest
+      - name: Seal the log
+        if: always()
+        env:
+          NAME: release-publish
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/seal.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-release-publish
+          path: ${{ runner.temp }}/sealed-release-publish.enc
+          if-no-files-found: ignore
+          retention-days: 14

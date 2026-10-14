@@ -1,0 +1,2 @@
+# Windows runners check text files out with CRLF line endings, which bash cannot run.
+*.sh text eol=lf
